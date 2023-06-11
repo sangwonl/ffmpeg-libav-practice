@@ -11,13 +11,16 @@ OPTS_LIBS = $(foreach l, $(LIBS_FFMPEG), -l$l)
 DEBUGFLAG = -g
 CXXFLAGS = $(OPTS_IDIRS) $(OPTS_LDIRS) $(OPTS_LIBS) $(DEBUGFLAG)
 
+crop: crop.cpp
+	$(CXX) $(CXXFLAGS) -o $@ $^
+
 hello: hello.cpp
 	$(CXX) $(CXXFLAGS) -o $@ $^
 
 .PHONY: clean
 clean:
-	rm hello 2> /dev/null | true
-	rm -rf hello.dSYM 2> /dev/null | true
+	rm hello crop 2> /dev/null | true
+	rm -rf *.dSYM 2> /dev/null | true
 
 # for static compile
 # https://ffmpeg.org/pipermail/ffmpeg-user/2015-December/029635.html
