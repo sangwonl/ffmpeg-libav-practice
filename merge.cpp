@@ -33,7 +33,7 @@ int main() {
     const char* outputFilename = "output.mp4";
     const char* pixelFormat = "uyvy422";
     // const AVCodecID outputCodecId = AV_CODEC_ID_H264;
-    const int fps = 60;
+    const int fps = 30;
 
     const int cropX = 100;
     const int cropY = 0;
@@ -55,7 +55,7 @@ int main() {
     av_dict_set(&options1, "capture_cursor", "1", 0);
 
     AVFormatContext* input1Context = nullptr;
-    if (avformat_open_input(&input1Context, "2:", inputFormat, &options1) != 0) {
+    if (avformat_open_input(&input1Context, "0:", inputFormat, &options1) != 0) {
         std::cout << "Failed to open input\n";
         return 1;
     }
@@ -90,7 +90,7 @@ int main() {
     av_dict_set(&options2, "capture_cursor", "1", 0);
 
     AVFormatContext* input2Context = nullptr;
-    if (avformat_open_input(&input2Context, "3:", inputFormat, &options2) != 0) {
+    if (avformat_open_input(&input2Context, "2:", inputFormat, &options2) != 0) {
         std::cout << "Failed to open input\n";
         return 1;
     }
@@ -139,8 +139,6 @@ int main() {
         std::cout << "Failed to find encoder: " << outputContext->video_codec_id << std::endl;
         return 1;
     }
-
-    AVStream *outVideoStream = input1Context->streams[input1VideoStreamIndex];
 
     // Set codec parameters for the output video stream
     AVCodecContext* outCodecContext = avcodec_alloc_context3(outputCodec);

@@ -11,6 +11,9 @@ OPTS_LIBS = $(foreach l, $(LIBS_FFMPEG), -l$l)
 DEBUGFLAG = -g
 CXXFLAGS = $(OPTS_IDIRS) $(OPTS_LDIRS) $(OPTS_LIBS) $(DEBUGFLAG)
 
+mergeaudio: mergeaudio.cpp
+	$(CXX) $(CXXFLAGS) -o $@ $^
+
 merge: merge.cpp
 	$(CXX) $(CXXFLAGS) -o $@ $^
 
@@ -22,7 +25,7 @@ hello: hello.cpp
 
 .PHONY: clean
 clean:
-	rm hello crop merge 2> /dev/null | true
+	rm hello crop merge mergeaudio 2> /dev/null | true
 	rm -rf *.dSYM 2> /dev/null | true
 
 # for static compile
