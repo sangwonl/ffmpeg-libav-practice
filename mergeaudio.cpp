@@ -5,12 +5,15 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
-#include <libavutil/avutil.h>
 #include <libavdevice/avdevice.h>
 #include <libswscale/swscale.h>
+#include <libswresample/swresample.h>
 #include <libavfilter/avfilter.h>
 #include <libavfilter/buffersrc.h>
 #include <libavfilter/buffersink.h>
+#include <libavutil/avutil.h>
+#include <libavutil/pixdesc.h>
+#include <libavutil/audio_fifo.h>
 }
 
 #define inputPixelFormat "uyvy422"
@@ -18,6 +21,11 @@ extern "C" {
 #define ouptutChannels 2
 #define outputSampleRate 48000
 #define outputFilename "output.mp4"
+
+static const AVRational videoEncoderTimeBase = av_make_q(1, 1000);
+static const AVRational videoContainerTimeBase = av_make_q(1, 16000);
+static const AVRational audioEncoderTimeBase = av_make_q(1, outputSampleRate);
+static const AVRational audioContainerTimeBase = av_make_q(1, outputSampleRate);
 
 typedef struct MediaParams {
     AVCodecID codecId;
@@ -45,6 +53,8 @@ typedef struct MediaContext {
   AVStream* audioStream;
   AVCodecContext* audioCodecCtx;
   AVFilterContext *audioBufferFilterCtx;
+  SwrContext* swrCtx;
+  AVAudioFifo* audioFifo;
 } MediaContext;
 
 bool shouldStop = false;
@@ -57,7 +67,7 @@ void signalHandler(int signum) {
     }
 }
 
-MediaContext* openInputMediaCtx(int screenIdx, int audioIdx, AVPixelFormat normalizedPixFmt) {
+MediaContext* openInputMediaCtx(int screenIdx, int audioIdx, MediaContext* outMediaCtx) {
     MediaContext* mediaCtx = (MediaContext*) calloc(1, sizeof(MediaContext));
 
     AVDictionary* options = nullptr;
@@ -84,34 +94,58 @@ MediaContext* openInputMediaCtx(int screenIdx, int audioIdx, AVPixelFormat norma
 
     int videoStreamIdx = av_find_best_stream(mediaCtx->formatCtx, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
     if (videoStreamIdx >= 0) {
+        mediaCtx->videoIndex = videoStreamIdx;
         mediaCtx->videoStream = mediaCtx->formatCtx->streams[videoStreamIdx];
         mediaCtx->videoCodec = const_cast<AVCodec*>(avcodec_find_decoder(mediaCtx->videoStream->codecpar->codec_id));
         mediaCtx->videoCodecCtx = avcodec_alloc_context3(mediaCtx->videoCodec);
+        mediaCtx->videoCodecCtx->time_base = mediaCtx->videoStream->time_base;
+
         avcodec_parameters_to_context(mediaCtx->videoCodecCtx, mediaCtx->videoStream->codecpar);
         avcodec_open2(mediaCtx->videoCodecCtx, mediaCtx->videoCodec, nullptr);
+
+        mediaCtx->swsCtx = sws_getContext(
+            mediaCtx->videoCodecCtx->width,
+            mediaCtx->videoCodecCtx->height,
+            mediaCtx->videoCodecCtx->pix_fmt,
+            mediaCtx->videoCodecCtx->width,
+            mediaCtx->videoCodecCtx->height,
+            outMediaCtx->videoCodecCtx->pix_fmt,
+            SWS_BICUBIC,
+            NULL,
+            NULL,
+            NULL
+        );
     }
 
     int audioStreamIdx = av_find_best_stream(mediaCtx->formatCtx, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
     if (audioStreamIdx >= 0) {
+        mediaCtx->audioIndex = audioStreamIdx;
         mediaCtx->audioStream = mediaCtx->formatCtx->streams[audioStreamIdx];
         mediaCtx->audioCodec = const_cast<AVCodec*>(avcodec_find_decoder(mediaCtx->audioStream->codecpar->codec_id));
         mediaCtx->audioCodecCtx = avcodec_alloc_context3(mediaCtx->audioCodec);
+        mediaCtx->audioCodecCtx->time_base = mediaCtx->audioStream->time_base;
+
         avcodec_parameters_to_context(mediaCtx->audioCodecCtx, mediaCtx->audioStream->codecpar);
         avcodec_open2(mediaCtx->audioCodecCtx, mediaCtx->audioCodec, nullptr);
-    }
 
-    mediaCtx->swsCtx = sws_getContext(
-        mediaCtx->videoCodecCtx->width,
-        mediaCtx->videoCodecCtx->height,
-        mediaCtx->videoCodecCtx->pix_fmt,
-        mediaCtx->videoCodecCtx->width,
-        mediaCtx->videoCodecCtx->height,
-        normalizedPixFmt,
-        SWS_BICUBIC,
-        NULL,
-        NULL,
-        NULL
-    );
+        swr_alloc_set_opts2(&mediaCtx->swrCtx,
+            &outMediaCtx->audioCodecCtx->ch_layout,
+            outMediaCtx->audioCodecCtx->sample_fmt,
+            outMediaCtx->audioCodecCtx->sample_rate,
+            &mediaCtx->audioCodecCtx->ch_layout,
+            mediaCtx->audioCodecCtx->sample_fmt,
+            mediaCtx->audioCodecCtx->sample_rate,
+            0,
+            nullptr);
+
+        swr_init(mediaCtx->swrCtx);
+
+        mediaCtx->audioFifo = av_audio_fifo_alloc(
+            outMediaCtx->audioCodecCtx->sample_fmt,
+            outMediaCtx->audioCodecCtx->ch_layout.nb_channels,
+            1
+        );
+    }
 
     av_dict_free(&options);
 
@@ -134,11 +168,13 @@ void prepareVideoCodec(MediaContext* mediaCtx, MediaParams* params) {
         return;
     }
 
+    mediaCtx->videoIndex = 0;
     mediaCtx->videoCodecCtx->width = params->width;
     mediaCtx->videoCodecCtx->height = params->height;
     mediaCtx->videoCodecCtx->sample_aspect_ratio = av_make_q(0, 1);
-    mediaCtx->videoCodecCtx->time_base = av_make_q(1, 1000);
     mediaCtx->videoCodecCtx->pix_fmt = AV_PIX_FMT_YUV420P;
+    mediaCtx->videoCodecCtx->time_base = videoEncoderTimeBase;
+    mediaCtx->videoStream->time_base = videoContainerTimeBase;
 
     if (avcodec_open2(mediaCtx->videoCodecCtx, mediaCtx->videoCodec, nullptr) < 0) {
         return ;
@@ -166,11 +202,12 @@ void prepareAudioCodec(MediaContext* mediaCtx, MediaParams* params) {
     AVChannelLayout channelLayout;
     av_channel_layout_default(&channelLayout, params->channels);
 
+    mediaCtx->audioIndex = 1;
     mediaCtx->audioCodecCtx->ch_layout = channelLayout;
     mediaCtx->audioCodecCtx->sample_rate = params->sampleRate;
     mediaCtx->audioCodecCtx->sample_fmt = mediaCtx->audioCodec->sample_fmts[0];
-    mediaCtx->audioCodecCtx->time_base = av_make_q(1, params->sampleRate);
-    mediaCtx->audioStream->time_base = mediaCtx->audioCodecCtx->time_base;
+    mediaCtx->audioCodecCtx->time_base = audioEncoderTimeBase;
+    mediaCtx->audioStream->time_base = audioContainerTimeBase;
 
     if (avcodec_open2(mediaCtx->audioCodecCtx, mediaCtx->audioCodec, nullptr) < 0) {
         return;
@@ -202,7 +239,7 @@ MediaContext* openOutputMediaCtx(const char* filename, MediaParams* videoParams,
     return mediaCtx;
 }
 
-AVFilterGraph* createFilterGraphForCropAndMerge(MediaContext* inputCtx1, MediaContext* inputCtx2, MediaContext* outputCtx, int cropX, int cropY, int cropWidth, int cropHeight) {
+AVFilterGraph* createFilterGraphForVideo(MediaContext* input1Ctx, MediaContext* input2Ctx, MediaContext* outputCtx, int cropX, int cropY, int cropWidth, int cropHeight) {
     AVFilterGraph *filterGraph = avfilter_graph_alloc();
 
     AVFilterContext *crop1Ctx;
@@ -219,29 +256,27 @@ AVFilterGraph* createFilterGraphForCropAndMerge(MediaContext* inputCtx1, MediaCo
     char filterArgs[512];
     snprintf(filterArgs, sizeof(filterArgs),
         "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
-        inputCtx1->videoCodecCtx->width,
-        inputCtx1->videoCodecCtx->height,
+        input1Ctx->videoCodecCtx->width,
+        input1Ctx->videoCodecCtx->height,
         outputCtx->videoCodecCtx->pix_fmt,
-        outputCtx->videoCodecCtx->time_base.num,
-        outputCtx->videoCodecCtx->time_base.den,
-        inputCtx1->videoCodecCtx->sample_aspect_ratio.num,
-        inputCtx1->videoCodecCtx->sample_aspect_ratio.den);
-
-    if (avfilter_graph_create_filter(&inputCtx1->videoBufferFilterCtx, bufferSrcFilter, "in1", filterArgs, nullptr, filterGraph) < 0) {
+        input1Ctx->videoCodecCtx->time_base.num,
+        input1Ctx->videoCodecCtx->time_base.den,
+        input1Ctx->videoCodecCtx->sample_aspect_ratio.num,
+        input1Ctx->videoCodecCtx->sample_aspect_ratio.den);
+    if (avfilter_graph_create_filter(&input1Ctx->videoBufferFilterCtx, bufferSrcFilter, "v-in1", filterArgs, nullptr, filterGraph) < 0) {
         return nullptr;
     }
 
     snprintf(filterArgs, sizeof(filterArgs),
         "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
-        inputCtx2->videoCodecCtx->width,
-        inputCtx2->videoCodecCtx->height,
+        input2Ctx->videoCodecCtx->width,
+        input2Ctx->videoCodecCtx->height,
         outputCtx->videoCodecCtx->pix_fmt,
-        outputCtx->videoCodecCtx->time_base.num,
-        outputCtx->videoCodecCtx->time_base.den,
-        inputCtx2->videoCodecCtx->sample_aspect_ratio.num,
-        inputCtx2->videoCodecCtx->sample_aspect_ratio.den);
-
-    if (avfilter_graph_create_filter(&inputCtx2->videoBufferFilterCtx, bufferSrcFilter, "in2", filterArgs, nullptr, filterGraph) < 0) {
+        input2Ctx->videoCodecCtx->time_base.num,
+        input2Ctx->videoCodecCtx->time_base.den,
+        input2Ctx->videoCodecCtx->sample_aspect_ratio.num,
+        input2Ctx->videoCodecCtx->sample_aspect_ratio.den);
+    if (avfilter_graph_create_filter(&input2Ctx->videoBufferFilterCtx, bufferSrcFilter, "v-in2", filterArgs, nullptr, filterGraph) < 0) {
         return nullptr;
     }
 
@@ -251,8 +286,7 @@ AVFilterGraph* createFilterGraphForCropAndMerge(MediaContext* inputCtx1, MediaCo
         cropHeight,
         cropX,
         cropY);
-
-    if (avfilter_graph_create_filter(&crop1Ctx, cropFilter, "crop1", filterArgs, nullptr, filterGraph) < 0) {
+    if (avfilter_graph_create_filter(&crop1Ctx, cropFilter, "v-crop1", filterArgs, nullptr, filterGraph) < 0) {
         return nullptr;
     }
 
@@ -262,8 +296,7 @@ AVFilterGraph* createFilterGraphForCropAndMerge(MediaContext* inputCtx1, MediaCo
         cropHeight,
         cropX,
         cropY);
-
-    if (avfilter_graph_create_filter(&crop2Ctx, cropFilter, "crop2", filterArgs, nullptr, filterGraph) < 0) {
+    if (avfilter_graph_create_filter(&crop2Ctx, cropFilter, "v-crop2", filterArgs, nullptr, filterGraph) < 0) {
         return nullptr;
     }
 
@@ -273,8 +306,7 @@ AVFilterGraph* createFilterGraphForCropAndMerge(MediaContext* inputCtx1, MediaCo
         cropHeight,
         0,
         0);
-
-    if (avfilter_graph_create_filter(&padCtx, padFilter, "pad", filterArgs, nullptr, filterGraph) < 0) {
+    if (avfilter_graph_create_filter(&padCtx, padFilter, "v-pad", filterArgs, nullptr, filterGraph) < 0) {
         return nullptr;
     }
 
@@ -282,16 +314,15 @@ AVFilterGraph* createFilterGraphForCropAndMerge(MediaContext* inputCtx1, MediaCo
         "%d:%d",
         cropWidth,
         0);
-
-    if (avfilter_graph_create_filter(&overlayCtx, overlayFilter, "overlay", filterArgs, nullptr, filterGraph) < 0) {
+    if (avfilter_graph_create_filter(&overlayCtx, overlayFilter, "v-overlay", filterArgs, nullptr, filterGraph) < 0) {
         return nullptr;
     }
 
-    if (avfilter_graph_create_filter(&outputCtx->videoBufferFilterCtx, bufferSinkFilter, "out", nullptr, nullptr, filterGraph) < 0) {
+    if (avfilter_graph_create_filter(&outputCtx->videoBufferFilterCtx, bufferSinkFilter, "v-out", nullptr, nullptr, filterGraph) < 0) {
         return nullptr;
     }
 
-    if (avfilter_link(inputCtx1->videoBufferFilterCtx, 0, crop1Ctx, 0) < 0) {
+    if (avfilter_link(input1Ctx->videoBufferFilterCtx, 0, crop1Ctx, 0) < 0) {
         return nullptr;
     }
 
@@ -303,7 +334,7 @@ AVFilterGraph* createFilterGraphForCropAndMerge(MediaContext* inputCtx1, MediaCo
         return nullptr;
     }
 
-    if (avfilter_link(inputCtx2->videoBufferFilterCtx, 0, crop2Ctx, 0) < 0) {
+    if (avfilter_link(input2Ctx->videoBufferFilterCtx, 0, crop2Ctx, 0) < 0) {
         return nullptr;
     }
 
@@ -322,10 +353,122 @@ AVFilterGraph* createFilterGraphForCropAndMerge(MediaContext* inputCtx1, MediaCo
     return filterGraph;
 }
 
+AVFilterGraph* createFilterGraphForAudio(MediaContext* input1Ctx, MediaContext* input2Ctx, MediaContext* outputCtx) {
+    AVFilterGraph *filterGraph = avfilter_graph_alloc();
+
+    AVFilterContext *mergeCtx;
+    AVFilterContext *panCtx;
+
+    const AVFilter *bufferSrcFilter = avfilter_get_by_name("abuffer");
+    const AVFilter *mergeFilter = avfilter_get_by_name("amerge");
+    const AVFilter *panFilter = avfilter_get_by_name("pan");
+    const AVFilter *bufferSinkFilter = avfilter_get_by_name("abuffersink");
+
+    char filterArgs[512];
+    snprintf(filterArgs, sizeof(filterArgs),
+        "time_base=%d/%d:sample_rate=%d:sample_fmt=%s:channel_layout=0x%"PRIx64,
+        outputCtx->audioCodecCtx->time_base.num,
+        outputCtx->audioCodecCtx->time_base.den,
+        input1Ctx->audioCodecCtx->sample_rate,
+        av_get_sample_fmt_name(input1Ctx->audioCodecCtx->sample_fmt),
+        input1Ctx->audioCodecCtx->channel_layout);
+    if (avfilter_graph_create_filter(&input1Ctx->audioBufferFilterCtx, bufferSrcFilter, "a-in1", filterArgs, nullptr, filterGraph) < 0) {
+        return nullptr;
+    }
+
+    snprintf(filterArgs, sizeof(filterArgs),
+        "time_base=%d/%d:sample_rate=%d:sample_fmt=%s:channel_layout=0x%"PRIx64,
+        outputCtx->audioCodecCtx->time_base.num,
+        outputCtx->audioCodecCtx->time_base.den,
+        input2Ctx->audioCodecCtx->sample_rate,
+        av_get_sample_fmt_name(input2Ctx->audioCodecCtx->sample_fmt),
+        input2Ctx->audioCodecCtx->channel_layout);
+    if (avfilter_graph_create_filter(&input2Ctx->audioBufferFilterCtx, bufferSrcFilter, "a-in2", filterArgs, nullptr, filterGraph) < 0) {
+        return nullptr;
+    }
+
+    snprintf(filterArgs, sizeof(filterArgs), "inputs=%d", 2);
+    if (avfilter_graph_create_filter(&mergeCtx, mergeFilter, "a-amerge", filterArgs, nullptr, filterGraph) < 0) {
+        return nullptr;
+    }
+
+    snprintf(filterArgs, sizeof(filterArgs), "stereo|FL=c0+c2|FR=c1+c2");
+    if (avfilter_graph_create_filter(&panCtx, panFilter, "a-pan", filterArgs, nullptr, filterGraph) < 0) {
+        return nullptr;
+    }
+
+    if (avfilter_graph_create_filter(&outputCtx->audioBufferFilterCtx, bufferSinkFilter, "a-out", nullptr, nullptr, filterGraph) < 0) {
+        return nullptr;
+    }
+
+    if (avfilter_link(input1Ctx->audioBufferFilterCtx, 0, mergeCtx, 0) < 0) {
+        return nullptr;
+    }
+
+    if (avfilter_link(input2Ctx->audioBufferFilterCtx, 0, mergeCtx, 1) < 0) {
+        return nullptr;
+    }
+
+    if (avfilter_link(mergeCtx, 0, panCtx, 0) < 0) {
+        return nullptr;
+    }
+
+    if (avfilter_link(panCtx, 0, outputCtx->audioBufferFilterCtx, 0) < 0) {
+        return nullptr;
+    }
+
+    if (avfilter_graph_config(filterGraph, nullptr) < 0) {
+        return nullptr;
+    }
+
+    return filterGraph;
+}
+
+void convert_video_frame(AVFrame* inputFrame, AVFrame* yuvFrame, MediaContext* inputCtx, MediaContext* outputCtx) {
+    yuvFrame->format = outputCtx->videoCodecCtx->pix_fmt;
+    yuvFrame->width = inputCtx->videoCodecCtx->width;
+    yuvFrame->height = inputCtx->videoCodecCtx->height;
+    av_frame_get_buffer(yuvFrame, 0);
+    sws_scale(inputCtx->swsCtx, inputFrame->data, inputFrame->linesize, 0, inputFrame->height, yuvFrame->data, yuvFrame->linesize);
+}
+
+int convert_audio_frame(AVFrame* inputFrame, AVFrame* resampledFrame, MediaContext* inputCtx, MediaContext* outputCtx) {
+    const AVSampleFormat outFormat = outputCtx->audioCodecCtx->sample_fmt;
+    const AVChannelLayout* outChLayout = &outputCtx->audioCodecCtx->ch_layout;
+    const int outFrameSize = outputCtx->audioCodecCtx->frame_size;
+    const int outSampleRate = outputCtx->audioCodecCtx->sample_rate;
+    const int inputFrameSize = inputFrame->nb_samples;
+
+    int curFifoSize = av_audio_fifo_size(inputCtx->audioFifo);
+    if (curFifoSize < outFrameSize) {
+        uint8_t** convertedSamples = (uint8_t**)calloc(outChLayout->nb_channels, sizeof(*convertedSamples));
+        int ret = av_samples_alloc(convertedSamples, nullptr, outChLayout->nb_channels, inputFrameSize, outFormat, 0);
+        swr_convert(inputCtx->swrCtx, convertedSamples, inputFrameSize, (const uint8_t**)inputFrame->extended_data, inputFrameSize);
+
+        av_audio_fifo_realloc(inputCtx->audioFifo, curFifoSize + inputFrameSize);
+        av_audio_fifo_write(inputCtx->audioFifo, (void**)convertedSamples, inputFrameSize);
+    }
+
+    curFifoSize = av_audio_fifo_size(inputCtx->audioFifo);
+    if (curFifoSize >= outFrameSize) {
+        const int readFrameSize = FFMIN(av_audio_fifo_size(inputCtx->audioFifo), outputCtx->audioCodecCtx->frame_size);
+        resampledFrame->nb_samples = readFrameSize;
+        resampledFrame->format = outFormat;
+        resampledFrame->sample_rate = outSampleRate;
+        av_channel_layout_copy(&resampledFrame->ch_layout, outChLayout);
+        av_frame_get_buffer(resampledFrame, 0);
+
+        av_audio_fifo_read(inputCtx->audioFifo, (void**)resampledFrame->data, readFrameSize);
+
+        return readFrameSize;
+    }
+
+    return 0;
+}
+
 int main() {
     std::signal(SIGINT, signalHandler);
 
-    // Initialize FFmpeg
     avdevice_register_all();
 
     const int cropX = 100;
@@ -336,23 +479,49 @@ int main() {
     MediaParams videoParams = { .width = cropWidth * 2, .height = cropHeight };
     MediaParams audioParams = { .channels = ouptutChannels, .sampleRate = outputSampleRate };
     MediaContext* outputCtx = openOutputMediaCtx(outputFilename, &videoParams, &audioParams);
-    MediaContext* inputCtx1 = openInputMediaCtx(2, 0, outputCtx->videoCodecCtx->pix_fmt);
-    MediaContext* inputCtx2 = openInputMediaCtx(3, 2, outputCtx->videoCodecCtx->pix_fmt);
+    MediaContext* input1Ctx = openInputMediaCtx(0, 0, outputCtx);
+    MediaContext* input2Ctx = openInputMediaCtx(2, 2, outputCtx);
 
-    createFilterGraphForCropAndMerge(inputCtx1, inputCtx2, outputCtx, cropX, cropY, cropWidth, cropHeight);
+    swr_alloc_set_opts2(&outputCtx->swrCtx,
+        &outputCtx->audioCodecCtx->ch_layout,
+        outputCtx->audioCodecCtx->sample_fmt,
+        outputCtx->audioCodecCtx->sample_rate,
+        &input1Ctx->audioCodecCtx->ch_layout,
+        input1Ctx->audioCodecCtx->sample_fmt,
+        input1Ctx->audioCodecCtx->sample_rate,
+        0,
+        nullptr);
+
+    swr_init(outputCtx->swrCtx);
+
+    outputCtx->audioFifo = av_audio_fifo_alloc(
+        outputCtx->audioCodecCtx->sample_fmt,
+        outputCtx->audioCodecCtx->ch_layout.nb_channels,
+        1
+    );
+
+    createFilterGraphForVideo(input1Ctx, input2Ctx, outputCtx, cropX, cropY, cropWidth, cropHeight);
+    createFilterGraphForAudio(input1Ctx, input2Ctx, outputCtx);
 
     // Read and encode frames
     AVPacket *input1Packet = av_packet_alloc();
     AVPacket *input2Packet = av_packet_alloc();
-    AVPacket *outputPacket = av_packet_alloc();
+    AVPacket *outputVidPacket = av_packet_alloc();
+    AVPacket *outputAudPacket = av_packet_alloc();
 
-    AVFrame *input1Frame = av_frame_alloc();
-    AVFrame *input2Frame = av_frame_alloc();
-    AVFrame *yuv1Frame = av_frame_alloc();
-    AVFrame *yuv2Frame = av_frame_alloc();
-    AVFrame *filteredFrame = av_frame_alloc();
+    AVFrame *input1VidFrame = av_frame_alloc();
+    AVFrame *input2VidFrame = av_frame_alloc();
+    AVFrame *input1YuvFrame = av_frame_alloc();
+    AVFrame *input2YuvFrame = av_frame_alloc();
+    AVFrame *filteredVidFrame = av_frame_alloc();
 
-    int64_t numFrames = -1;
+    AVFrame *input1AudFrame = av_frame_alloc();
+    AVFrame *input2AudFrame = av_frame_alloc();
+    AVFrame *filteredAudFrame = av_frame_alloc();
+    AVFrame *filteredResampledFrame = av_frame_alloc();
+
+    int64_t numVidFrames = 0;
+    int64_t numAudSamples = 0;
 
     // Write the header to the output file
     if (avformat_write_header(outputCtx->formatCtx, nullptr) < 0) {
@@ -360,78 +529,106 @@ int main() {
     }
 
     while (!allDone) {
-        if (av_read_frame(inputCtx1->formatCtx, input1Packet) == 0) {
-            if (input1Packet->stream_index == inputCtx1->videoIndex) {
-                avcodec_send_packet(inputCtx1->videoCodecCtx, input1Packet);
+        if (av_read_frame(input1Ctx->formatCtx, input1Packet) == 0) {
+            if (input1Packet->stream_index == input1Ctx->videoIndex) {
+                avcodec_send_packet(input1Ctx->videoCodecCtx, input1Packet);
+            } else if (input1Packet->stream_index == input1Ctx->audioIndex) {
+                avcodec_send_packet(input1Ctx->audioCodecCtx, input1Packet);
             }
         }
 
-        if (av_read_frame(inputCtx2->formatCtx, input2Packet) == 0) {
-            if (input2Packet->stream_index == inputCtx2->videoIndex) {
-                avcodec_send_packet(inputCtx2->videoCodecCtx, input2Packet);
+        if (av_read_frame(input2Ctx->formatCtx, input2Packet) == 0) {
+            if (input2Packet->stream_index == input2Ctx->videoIndex) {
+                avcodec_send_packet(input2Ctx->videoCodecCtx, input2Packet);
+            } else if (input2Packet->stream_index == input2Ctx->audioIndex) {
+                avcodec_send_packet(input2Ctx->audioCodecCtx, input2Packet);
             }
         }
 
-        if (avcodec_receive_frame(inputCtx1->videoCodecCtx, input1Frame) == 0) {
-            yuv1Frame->format = outputCtx->videoCodecCtx->pix_fmt;
-            yuv1Frame->width = inputCtx1->videoCodecCtx->width;
-            yuv1Frame->height = inputCtx1->videoCodecCtx->height;
-            av_frame_get_buffer(yuv1Frame, 0);
-
-            sws_scale(inputCtx1->swsCtx, input1Frame->data, input1Frame->linesize, 0, input1Frame->height, yuv1Frame->data, yuv1Frame->linesize);
-
-            av_buffersrc_add_frame(inputCtx1->videoBufferFilterCtx, yuv1Frame);
+        if (avcodec_receive_frame(input1Ctx->videoCodecCtx, input1VidFrame) == 0) {
+            convert_video_frame(input1VidFrame, input1YuvFrame, input1Ctx, outputCtx);
+            av_buffersrc_add_frame(input1Ctx->videoBufferFilterCtx, input1YuvFrame);
         }
 
-        if (avcodec_receive_frame(inputCtx2->videoCodecCtx, input2Frame) == 0) {
-            yuv2Frame->format = outputCtx->videoCodecCtx->pix_fmt;
-            yuv2Frame->width = inputCtx2->videoCodecCtx->width;
-            yuv2Frame->height = inputCtx2->videoCodecCtx->height;
-            av_frame_get_buffer(yuv2Frame, 0);
-
-            sws_scale(inputCtx2->swsCtx, input2Frame->data, input2Frame->linesize, 0, input2Frame->height, yuv2Frame->data, yuv2Frame->linesize);
-
-            av_buffersrc_add_frame(inputCtx2->videoBufferFilterCtx, yuv2Frame);
+        if (avcodec_receive_frame(input2Ctx->videoCodecCtx, input2VidFrame) == 0) {
+            convert_video_frame(input2VidFrame, input2YuvFrame, input2Ctx, outputCtx);
+            av_buffersrc_add_frame(input2Ctx->videoBufferFilterCtx, input2YuvFrame);
         }
 
-        if (av_buffersink_get_frame(outputCtx->videoBufferFilterCtx, filteredFrame) == 0) {
-            numFrames++;
+        if (avcodec_receive_frame(input1Ctx->audioCodecCtx, input1AudFrame) == 0) {
+            av_buffersrc_add_frame(input1Ctx->audioBufferFilterCtx, input1AudFrame);
+        }
 
-            // Rescale timestamps
-            filteredFrame->pts = av_rescale_rnd(numFrames, outputCtx->videoCodecCtx->time_base.den, inputFps, AVRounding(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+        if (avcodec_receive_frame(input2Ctx->audioCodecCtx, input2AudFrame) == 0) {
+            av_buffersrc_add_frame(input2Ctx->audioBufferFilterCtx, input2AudFrame);
+        }
+
+        if (av_buffersink_get_frame(outputCtx->videoBufferFilterCtx, filteredVidFrame) == 0) {
+            filteredVidFrame->pts = av_rescale_q_rnd(numVidFrames++,
+                (AVRational){1, inputFps},
+                outputCtx->videoCodecCtx->time_base,
+                AVRounding(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
 
             if (!shouldStop) {
-                avcodec_send_frame(outputCtx->videoCodecCtx, filteredFrame);
+                avcodec_send_frame(outputCtx->videoCodecCtx, filteredVidFrame);
             }
         }
 
-        int ret = avcodec_receive_packet(outputCtx->videoCodecCtx, outputPacket);
-        if (ret == 0) {
-            outputPacket->stream_index = outputCtx->videoStream->index;
-            av_packet_rescale_ts(outputPacket, outputCtx->videoCodecCtx->time_base, outputCtx->videoStream->time_base);
+        if (av_buffersink_get_frame(outputCtx->audioBufferFilterCtx, filteredAudFrame) == 0) {
+            int convertedSize = convert_audio_frame(filteredAudFrame, filteredResampledFrame, input1Ctx, outputCtx);
+            if (convertedSize > 0) {
+                filteredResampledFrame->pts = av_rescale_q_rnd(numAudSamples,
+                (AVRational){1, outputCtx->audioCodecCtx->sample_rate},
+                outputCtx->audioCodecCtx->time_base,
+                AVRounding(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+                numAudSamples += convertedSize;
 
-            // Write the packet to the output file
-            av_interleaved_write_frame(outputCtx->formatCtx, outputPacket);
+                if (!shouldStop) {
+                    avcodec_send_frame(outputCtx->audioCodecCtx, filteredResampledFrame);
+                }
+            }
+        }
+
+        int ret = avcodec_receive_packet(outputCtx->videoCodecCtx, outputVidPacket);
+        if (ret == 0) {
+            outputVidPacket->stream_index = outputCtx->videoIndex;
+            av_packet_rescale_ts(outputVidPacket, outputCtx->videoCodecCtx->time_base, outputCtx->videoStream->time_base);
+
+            av_interleaved_write_frame(outputCtx->formatCtx, outputVidPacket);
         } else if (ret == AVERROR(EAGAIN)) {
             allDone = shouldStop;
         }
 
-        av_frame_unref(filteredFrame);
-        av_frame_unref(yuv1Frame);
-        av_frame_unref(yuv2Frame);
-        av_frame_unref(input1Frame);
-        av_frame_unref(input2Frame);
+        if (avcodec_receive_packet(outputCtx->audioCodecCtx, outputAudPacket) == 0) {
+            outputAudPacket->stream_index = outputCtx->audioIndex;
+            av_packet_rescale_ts(outputAudPacket, outputCtx->audioCodecCtx->time_base, outputCtx->audioStream->time_base);
+
+            av_interleaved_write_frame(outputCtx->formatCtx, outputAudPacket);
+        }
+
+        av_frame_unref(filteredResampledFrame);
+        av_frame_unref(filteredAudFrame);
+        av_frame_unref(input1AudFrame);
+        av_frame_unref(input2AudFrame);
+
+        av_frame_unref(filteredVidFrame);
+        av_frame_unref(input1YuvFrame);
+        av_frame_unref(input2YuvFrame);
+        av_frame_unref(input1VidFrame);
+        av_frame_unref(input2VidFrame);
+
         av_packet_unref(input1Packet);
         av_packet_unref(input2Packet);
-        av_packet_unref(outputPacket);
+        av_packet_unref(outputAudPacket);
+        av_packet_unref(outputVidPacket);
     }
 
     // Write the trailer to the output file
     av_write_trailer(outputCtx->formatCtx);
 
     // Cleanup
-    avformat_close_input(&inputCtx1->formatCtx);
-    avformat_close_input(&inputCtx2->formatCtx);
+    avformat_close_input(&input1Ctx->formatCtx);
+    avformat_close_input(&input2Ctx->formatCtx);
     avformat_free_context(outputCtx->formatCtx);
     avformat_network_deinit();
 

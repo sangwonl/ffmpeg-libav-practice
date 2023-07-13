@@ -2,7 +2,7 @@ CXX = g++
 
 IDIRS = ../ffmpeg-apple-arm64-build/out/include
 LDIRS = ../ffmpeg-apple-arm64-build/out/lib
-LIBS_FFMPEG = avcodec avformat avfilter avutil avdevice swscale # swresample
+LIBS_FFMPEG = avcodec avformat avfilter avutil avdevice swscale swresample
 
 OPTS_IDIRS = $(foreach i, $(IDIRS), -I$i)
 OPTS_LDIRS = $(foreach l, $(LDIRS), -L$l)
